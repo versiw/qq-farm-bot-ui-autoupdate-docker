@@ -22,6 +22,9 @@ COPY web/package.json ./web/
 # 安装所有依赖
 RUN pnpm install --frozen-lockfile
 
+COPY core ./core
+COPY web ./web
+
 # 构建前端静态文件
 RUN pnpm build:web
 
