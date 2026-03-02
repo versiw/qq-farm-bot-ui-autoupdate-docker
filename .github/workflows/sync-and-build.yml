@@ -1,14 +1,15 @@
-name: 同步上游并构建 (Sync Upstream and Build)
+name: 自动构建镜像 (Auto Build Docker Image)
 
 on:
   schedule:
     - cron: "0 0 * * *" # 每天凌晨 0:00 执行
-  workflow_dispatch: # 允许手动点击触发
+  workflow_dispatch:      # 允许手动点击触发
   push:
     branches:
       - main
-    paths-ignore: # 忽略版本记录文件的变动
-      - "last_version.txt"
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/**'
 
 env:
   REGISTRY: ghcr.io
@@ -16,149 +17,59 @@ env:
   UPSTREAM_REPO: Penty-d/qq-farm-bot-ui
 
 jobs:
-  sync-and-build:
+  build-and-publish:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write
-      packages: write
+      contents: write   # 用于更新 last_version.txt（如果需要）
+      packages: write   # 用于推送到 GHCR
 
     steps:
       - name: 检出本仓库 (Checkout this repo)
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
+        
       - name: 检出上游仓库 (Checkout upstream repo)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: main
-          path: upstream_temp
+          path: upstream_code
 
-      - name: 同步代码并备份 Action (Sync code and Backup actions)
-        run: |
-          # 1. 同步主体代码
-          # 排除 .git, .github (保护本地 Action), Dockerfile, last_version.txt
-          rsync -av --delete \
-            --exclude='.git/' \
-            --exclude='.github/' \
-            --exclude='Dockerfile' \
-            --exclude='last_version.txt' \
-            --exclude='README.md' \
-            --exclude='upstream_temp/' \
-            upstream_temp/ ./
-
-          # 处理原作者 README 的记录备份
-          if [ -f "upstream_temp/README.md" ]; then
-            echo "正在备份原作者 README..."
-            cp "upstream_temp/README.md" "./UPSTREAM_README.md"
-          fi
-
-          # 处理原仓库 Action 的备份
-          BACKUP_DIR=".github/upstream_backup"
-          rm -rf "$BACKUP_DIR"
-          mkdir -p "$BACKUP_DIR"
-
-
-          if [ -d "upstream_temp/.github" ]; then
-            echo "正在备份原仓库 .github 目录..."
-            cp -r upstream_temp/.github/* "$BACKUP_DIR/"
-            
-            # 将 .yml/.yaml 重命名为 .bak，防止 GitHub 误识别运行
-            find "$BACKUP_DIR" -name "*.yml" -exec mv {} {}.bak \;
-            find "$BACKUP_DIR" -name "*.yaml" -exec mv {} {}.bak \;
-            
-            echo "✅ 原仓库 Action 已备份并重命名至 $BACKUP_DIR"
-          fi
-
-          # 清理临时目录
-          rm -rf upstream_temp
-
-      - name: 获取当前版本 (Get current version)
+      - name: 获取上游版本号 (Get upstream version)
         id: get_version
         run: |
-          # 提取版本号，如果提取失败或文件不存在，则输出 unknown
-          VERSION=$(jq -r .version core/package.json 2>/dev/null || echo "unknown")
-
-          # 进一步检查：如果 jq 返回的是 null (字段不存在)
+          VERSION=$(jq -r .version upstream_code/core/package.json 2>/dev/null || echo "unknown")
+          
           if [ "$VERSION" == "null" ] || [ "$VERSION" == "unknown" ]; then
-            echo "::warning::无法从 core/package.json 获取有效版本号"
+            echo "::warning::无法从 upstream_code/core/package.json 获取有效版本号"
             VERSION="unknown"
           fi
-
+          
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "检测到版本号: $VERSION"
+          echo "检测到上游版本号: $VERSION"
 
-      - name: 检查版本变动 (Check version change)
+      - name: 检查版本是否变动 (Check version change)
         id: check_change
         run: |
+          # 读取本地记录的旧版本号
           LAST_VERSION=$([ -f last_version.txt ] && cat last_version.txt || echo "0.0.0")
           CUR_VERSION="${{ steps.get_version.outputs.version }}"
 
-          # 逻辑增强：如果当前版本为 unknown，则判定为未改变(changed=false)以跳过构建
           if [ "$CUR_VERSION" == "unknown" ]; then
-            echo "警告: 当前版本号异常，将跳过本次镜像构建。 (Current version is unknown, skipping build.)"
+            echo "警告: 当前版本号异常，将跳过本次镜像构建。"
             echo "changed=false" >> $GITHUB_OUTPUT
           elif [ "$CUR_VERSION" != "$LAST_VERSION" ]; then
             echo "检测到版本更新: $LAST_VERSION -> $CUR_VERSION"
             echo "changed=true" >> $GITHUB_OUTPUT
           else
-            echo "版本未发生变动。 (No version change detected.)"
+            echo "版本未发生变动 ($CUR_VERSION)。跳过构建。"
             echo "changed=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: 提交并推送更改 (Commit and Push changes)
+      - name: 准备构建环境 (Prepare Build Context)
+        if: steps.check_change.outputs.changed == 'true'
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-
-          # 只有在版本有效且发生变动时才更新记录文件
-          if [ "${{ steps.check_change.outputs.changed }}" == "true" ]; then
-            echo "${{ steps.get_version.outputs.version }}" > last_version.txt
-          fi
-
-          git add .
-
-          if git diff --staged --quiet; then
-            echo "代码没有变动，无需推送。"
-          else
-            # 使用 [skip ci] 确保自动同步推送不会再次触发工作流
-            git commit -m "sync: update upstream code & backup actions [skip ci]"
-            git push
-          fi
-
-      - name: 设置 Docker Buildx (Set up Docker Buildx)
-        if: steps.check_change.outputs.changed == 'true'
-        uses: docker/setup-buildx-action@v3
-
-      - name: 登录 GHCR (Log in to GHCR)
-        if: steps.check_change.outputs.changed == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 提取镜像元数据 (Extract metadata)
-        if: steps.check_change.outputs.changed == 'true'
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=raw,value=${{ steps.get_version.outputs.version }}
-            type=sha,format=short
-
-      - name: 构建并推送镜像 (Build and push Docker image)
-        if: steps.check_change.outputs.changed == 'true'
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # 将本仓库的自定义 Dockerfile 复制到上游代码的根目录中
+          cp Dockerfile upstream_code/Dockerfile
+          # 创建一个针对上游代码的临时 .dockerignore，确保前端编译正常
+          echo -e "node_modu
