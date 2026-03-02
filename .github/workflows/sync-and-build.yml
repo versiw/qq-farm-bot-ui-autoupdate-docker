@@ -1,12 +1,14 @@
-name: Sync Upstream and Build
+name: 同步上游并构建 (Sync Upstream and Build)
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 每天凌晨 0:00 自动检查并构建
-  workflow_dispatch:      # 允许手动点击按钮触发构建
+    - cron: "0 0 * * *" # 每天凌晨 0:00 执行
+  workflow_dispatch: # 允许手动点击触发
   push:
     branches:
-      - main              # 当你修改这个仓库的配置时也触发
+      - main
+    paths-ignore: # 忽略版本记录文件的变动
+      - "last_version.txt"
 
 env:
   REGISTRY: ghcr.io
@@ -14,53 +16,145 @@ env:
   UPSTREAM_REPO: Penty-d/qq-farm-bot-ui
 
 jobs:
-  build-and-push:
+  sync-and-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
-      # 1. 拉取原作者的最新代码
-      - name: Checkout upstream repo
+      - name: 检出本仓库 (Checkout this repo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 检出上游仓库 (Checkout upstream repo)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.UPSTREAM_REPO }}
-          ref: main  # 或者使用 pr 分支，取决于你想用哪个版本
+          ref: main
+          path: upstream_temp
 
-      # 2. 将你仓库里的 Dockerfile 复制到原作者的代码目录中
-      # 因为上一步把原作者代码下载到了当前目录，我们需要确保 Dockerfile 存在
-      - name: Get Dockerfile from this repo
+      - name: 同步代码并备份 Action (Sync code and Backup actions)
         run: |
-          curl -O https://raw.githubusercontent.com/${{ github.repository }}/main/Dockerfile
+          # 1. 同步主体代码
+          # 排除 .git, .github (保护本地 Action), Dockerfile, last_version.txt
+          rsync -av --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='Dockerfile' \
+            --exclude='last_version.txt' \
+            --exclude='README.md' \
+            upstream_temp/ ./
 
-      - name: Set up Docker Buildx
+          # 2. 处理原仓库 Action 的备份
+          BACKUP_DIR=".github/upstream_backup"
+          rm -rf "$BACKUP_DIR"
+          mkdir -p "$BACKUP_DIR"
+
+          # 3. 处理原作者 README 的记录备份
+          if [ -f "upstream_temp/README.md" ]; then
+            echo "正在备份原作者 README..."
+            cp "upstream_temp/README.md" "./UPSTREAM_README.md"
+          fi
+
+          if [ -d "upstream_temp/.github" ]; then
+            echo "正在备份原仓库 .github 目录..."
+            cp -r upstream_temp/.github/* "$BACKUP_DIR/"
+            
+            # 将 .yml/.yaml 重命名为 .bak，防止 GitHub 误识别运行
+            find "$BACKUP_DIR" -name "*.yml" -exec mv {} {}.bak \;
+            find "$BACKUP_DIR" -name "*.yaml" -exec mv {} {}.bak \;
+            
+            echo "✅ 原仓库 Action 已备份并重命名至 $BACKUP_DIR"
+          fi
+
+          # 清理临时目录
+          rm -rf upstream_temp
+
+      - name: 获取当前版本 (Get current version)
+        id: get_version
+        run: |
+          # 提取版本号，如果提取失败或文件不存在，则输出 unknown
+          VERSION=$(jq -r .version core/package.json 2>/dev/null || echo "unknown")
+
+          # 进一步检查：如果 jq 返回的是 null (字段不存在)
+          if [ "$VERSION" == "null" ] || [ "$VERSION" == "unknown" ]; then
+            echo "::warning::无法从 core/package.json 获取有效版本号"
+            VERSION="unknown"
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "检测到版本号: $VERSION"
+
+      - name: 检查版本变动 (Check version change)
+        id: check_change
+        run: |
+          LAST_VERSION=$([ -f last_version.txt ] && cat last_version.txt || echo "0.0.0")
+          CUR_VERSION="${{ steps.get_version.outputs.version }}"
+
+          # 逻辑增强：如果当前版本为 unknown，则判定为未改变(changed=false)以跳过构建
+          if [ "$CUR_VERSION" == "unknown" ]; then
+            echo "警告: 当前版本号异常，将跳过本次镜像构建。 (Current version is unknown, skipping build.)"
+            echo "changed=false" >> $GITHUB_OUTPUT
+          elif [ "$CUR_VERSION" != "$LAST_VERSION" ]; then
+            echo "检测到版本更新: $LAST_VERSION -> $CUR_VERSION"
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "版本未发生变动。 (No version change detected.)"
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 提交并推送更改 (Commit and Push changes)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 只有在版本有效且发生变动时才更新记录文件
+          if [ "${{ steps.check_change.outputs.changed }}" == "true" ]; then
+            echo "${{ steps.get_version.outputs.version }}" > last_version.txt
+          fi
+
+          git add .
+
+          if git diff --staged --quiet; then
+            echo "代码没有变动，无需推送。"
+          else
+            # 使用 [skip ci] 确保自动同步推送不会再次触发工作流
+            git commit -m "sync: update upstream code & backup actions [skip ci]"
+            git push
+          fi
+
+      - name: 设置 Docker Buildx (Set up Docker Buildx)
+        if: steps.check_change.outputs.changed == 'true'
         uses: docker/setup-buildx-action@v3
 
-      # 3. 登录 GHCR
-      - name: Log in to GHCR
+      - name: 登录 GHCR (Log in to GHCR)
+        if: steps.check_change.outputs.changed == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 4. 生成镜像标签
-      - name: Extract metadata
+      - name: 提取镜像元数据 (Extract metadata)
+        if: steps.check_change.outputs.changed == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
-            type=schedule,pattern={{date 'YYYYMMDD'}}
-            type=sha
+            type=raw,value=${{ steps.get_version.outputs.version }}
+            type=sha,format=short
 
-      # 5. 构建并推送
-      - name: Build and push
+      - name: 构建并推送镜像 (Build and push Docker image)
+        if: steps.check_change.outputs.changed == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ./Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
