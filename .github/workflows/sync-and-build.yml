@@ -46,18 +46,20 @@ jobs:
             --exclude='Dockerfile' \
             --exclude='last_version.txt' \
             --exclude='README.md' \
+            --exclude='upstream_temp/' \
             upstream_temp/ ./
 
-          # 2. 处理原仓库 Action 的备份
-          BACKUP_DIR=".github/upstream_backup"
-          rm -rf "$BACKUP_DIR"
-          mkdir -p "$BACKUP_DIR"
-
-          # 3. 处理原作者 README 的记录备份
+          # 处理原作者 README 的记录备份
           if [ -f "upstream_temp/README.md" ]; then
             echo "正在备份原作者 README..."
             cp "upstream_temp/README.md" "./UPSTREAM_README.md"
           fi
+
+          # 处理原仓库 Action 的备份
+          BACKUP_DIR=".github/upstream_backup"
+          rm -rf "$BACKUP_DIR"
+          mkdir -p "$BACKUP_DIR"
+
 
           if [ -d "upstream_temp/.github" ]; then
             echo "正在备份原仓库 .github 目录..."
