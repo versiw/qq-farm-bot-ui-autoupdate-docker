@@ -35,35 +35,35 @@ jobs:
           ref: main
           path: upstream_code # 将上游代码放在独立目录，不污染根目录
 
-      - name: 获取上游版本号 (Get upstream version)
-        id: get_version
+      - name: 解析 Update.log 指纹 (Resolve Update.log fingerprint)
+        id: get_update
         run: |
-          # 从检出的上游代码目录中读取版本
-          VERSION=$(jq -r .version upstream_code/core/package.json 2>/dev/null || echo "unknown")
-
-          if [ "$VERSION" == "null" ] || [ "$VERSION" == "unknown" ]; then
-            echo "::warning::无法从 upstream_code/core/package.json 获取有效版本号信号"
-            VERSION="unknown"
+          # 优先使用 Update.log 的最后一次修改提交 SHA；若浅克隆无法拿到，回退为文件内容哈希
+          if [ -f upstream_code/Update.log ]; then
+            SHA=$(git -C upstream_code log -n 1 --pretty=format:%H -- Update.log || true)
+            if [ -z "$SHA" ]; then
+              SHA=$(sha256sum upstream_code/Update.log | cut -d' ' -f1 || echo "")
+            fi
+          else
+            SHA=""
           fi
+          SHORT=${SHA:0:7}
+          echo "sha=$SHA"   >> $GITHUB_OUTPUT
+          echo "short=$SHORT" >> $GITHUB_OUTPUT
 
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "检测到上游版本号: $VERSION"
-
-      - name: 检查版本是否变动 (Check version change)
+      - name: 检查是否有更新 (Check Update.log change)
         id: check_change
         run: |
-          # 读取本地记录的旧版本号
-          LAST_VERSION=$([ -f last_version.txt ] && cat last_version.txt || echo "0.0.0")
-          CUR_VERSION="${{ steps.get_version.outputs.version }}"
-
-          if [ "$CUR_VERSION" == "unknown" ]; then
-            echo "警告: 当前版本号异常，跳过构建。"
+          LAST=$([ -f last_version.txt ] && cat last_version.txt || echo "")
+          CUR="${{ steps.get_update.outputs.sha }}"
+          if [ -z "$CUR" ]; then
+            echo "未能获得 Update.log 指纹，跳过构建"
             echo "changed=false" >> $GITHUB_OUTPUT
-          elif [ "$CUR_VERSION" != "$LAST_VERSION" ]; then
-            echo "检测到版本更新: $LAST_VERSION -> $CUR_VERSION"
-            echo "changed=true" >> $GITHUB_OUTPUT
+          elif [ "$CUR" != "$LAST" ]; then
+            echo "检测到 Update.log 变更: $LAST -> $CUR"
+            echo "changed=true"  >> $GITHUB_OUTPUT
           else
-            echo "版本未发生变动 ($CUR_VERSION)。跳过构建。"
+            echo "Update.log 未变化，跳过构建"
             echo "changed=false" >> $GITHUB_OUTPUT
           fi
 
@@ -85,16 +85,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: 读取 core/web 版本号 (Read core/web versions)
+        if: steps.check_change.outputs.changed == 'true'
+        id: get_versions
+        run: |
+          CORE=$(jq -r '.version // empty' upstream_code/core/package.json 2>/dev/null || echo "")
+          WEB=$(jq -r '.version // empty' upstream_code/web/package.json 2>/dev/null || echo "")
+          echo "core=$CORE" >> $GITHUB_OUTPUT
+          echo "web=$WEB"   >> $GITHUB_OUTPUT
+
+      - name: 组合构建标签 (Compose tags)
+        if: steps.check_change.outputs.changed == 'true'
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "BUILD_TAGS<<EOF" >> $GITHUB_ENV
+          echo "$IMAGE:latest" >> $GITHUB_ENV
+          echo "$IMAGE:sha-${{ steps.get_update.outputs.short }}" >> $GITHUB_ENV
+          if [ -n "${{ steps.get_versions.outputs.core }}" ]; then echo "$IMAGE:core-v${{ steps.get_versions.outputs.core }}" >> $GITHUB_ENV; fi
+          if [ -n "${{ steps.get_versions.outputs.web }}" ]; then echo "$IMAGE:web-v${{ steps.get_versions.outputs.web }}" >> $GITHUB_ENV; fi
+          echo "EOF" >> $GITHUB_ENV
+
       - name: 提取镜像元数据 (Extract metadata)
         if: steps.check_change.outputs.changed == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=raw,value=${{ steps.get_version.outputs.version }}
-            type=sha,format=short
 
       - name: 构建并推送镜像 (Build and push Docker image)
         if: steps.check_change.outputs.changed == 'true'
@@ -103,15 +119,15 @@ jobs:
           context: ./upstream_code
           file: ./Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ env.BUILD_TAGS }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: 仅更新版本记录文件 (Update version record ONLY)
+      - name: 仅更新版本记录文件 (Update fingerprint ONLY)
         if: steps.check_change.outputs.changed == 'true'
         run: |
-          echo "${{ steps.get_version.outputs.version }}" > last_version.txt
+          echo "${{ steps.get_update.outputs.sha }}" > last_version.txt
 
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -121,6 +137,6 @@ jobs:
           if git diff --staged --quiet; then
             echo "版本文件未变化"
           else
-            git commit -m "chore: 记录新版本号 ${{ steps.get_version.outputs.version }} [skip ci]"
+            git commit -m "chore: 记录 Update.log 指纹 ${{ steps.get_update.outputs.sha }} [skip ci]"
             git push
           fi

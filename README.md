@@ -7,6 +7,19 @@
 - **智能构建**：每日自动检查原作者发布的最新版本，一旦检测到核心版本号更新，即刻触发镜像构建。
 - **开箱即用**：封装了经过优化的 Dockerfile，内置了中国时区（Asia/Shanghai），确保农场任务时间准确。
 
+## ☁️ 推荐部署：ClawCloud 容器托管
+
+ClawCloud 是面向 Docker 的托管部署服务，支持从 GitHub 镜像一键部署，省去本地运维与服务器管理成本。建议通过 ClawCloud 部署本镜像：
+
+- 立即开始：<a href="https://console.run.claw.cloud/signin?link=MA1UKU965L7I" target="_blank" rel="noopener noreferrer">点此开始</a>
+
+福利说明：
+- 新手福利（一次性）$5 额度
+  - GitHub 用户：账号注册满 7 天可领取
+  - Gmail 用户：无额外条件
+- 每月福利（循环）$5 额度
+  - 绑定 GitHub 账号后解锁（GitHub 账号需注册满 180 天）
+
 ## 🚀 快速开始
 
 使用 Docker 快速部署：
